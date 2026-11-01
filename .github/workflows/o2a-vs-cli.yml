@@ -70,7 +70,7 @@ jobs:
               "free_tier_block_seconds": 30
             },
             "logging": { "level": "info", "ring_size": 500, "dump_request_bodies": false },
-            "webui": { "enabled": false, "listen": "127.0.0.1:8081", "username": "admin", "password": "x", "session_ttl_minutes": 60 },
+            "webui": { "enabled": false, "listen": "127.0.0.1:8081", "username": "admin", "password": "local-test-password", "session_ttl_minutes": 60 },
             "prefer": "go",
             "reasoning": { "effort": "high", "effort_by_model": {} },
             "rotation": { "sota": { "alias": "sota", "order": [] }, "sweet": { "alias": "sweet", "order": [] }, "first_output_seconds": 30 }
