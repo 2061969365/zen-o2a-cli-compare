@@ -1,0 +1,162 @@
+name: o2a-vs-cli-multiip
+
+# 同一出口 IP 上对照两件事：
+#   A) opencode2api 网关（匿名 public 通道）请求 deepseek-v4.1-flash-free
+#   B) 官方 CLI 直连上游跑真实两轮对话（参照组）
+# 6 个独立 runner = 6 个出口 IP。
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: egress ip
+        run: |
+          curl -s -m 20 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print("SHARD=${{ matrix.shard }} IP=", j.get("query"), j.get("countryCode",""), j.get("as",""))'
+
+      - uses: actions/checkout@v4
+        with:
+          repository: jasonxu114514/opencode2api
+          path: gw
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+
+      - name: build gateway
+        run: |
+          set -e
+          cd gw
+          go build -trimpath -o /tmp/opencode2api ./cmd/opencode2api
+          echo "BUILD_OK $(ls -l /tmp/opencode2api | awk '{print $5}') bytes"
+
+      - name: start gateway
+        run: |
+          set -e
+          cat > /tmp/config.json <<'JSON'
+          {
+            "listen": "127.0.0.1:8080",
+            "server_keys": ["sk-local-test"],
+            "zen_keys": [],
+            "go_keys": [],
+            "anonymous": true,
+            "warp": { "enabled": false, "pool_size": 2, "stack": "ipv6", "source_ipv6": "" },
+            "proxies": ["direct"],
+            "proxyfile": "",
+            "upstream": {
+              "zen": "https://opencode.ai/zen",
+              "go": "https://opencode.ai/zen/go",
+              "anonymous": "https://opencode.ai/inference"
+            },
+            "retry": { "max_attempts": 1, "timeout_seconds": 120 },
+            "models": { "refresh_seconds": 300, "protocols": {}, "free_only": false },
+            "performance": {
+              "max_idle_conns": 256,
+              "max_idle_conns_per_host": 64,
+              "max_conns_per_host": 0,
+              "idle_conn_timeout_seconds": 60,
+              "connect_timeout_seconds": 5,
+              "failure_cooldown_seconds": 0,
+              "attempt_timeout_seconds": 0,
+              "first_event_timeout_seconds": 0,
+              "max_anonymous_exits": 8,
+              "free_tier_block_seconds": 0
+            },
+            "logging": { "level": "info", "ring_size": 500, "dump_request_bodies": false },
+            "webui": { "enabled": false, "listen": "127.0.0.1:8081", "username": "admin", "password": "x", "session_ttl_minutes": 60 },
+            "prefer": "go",
+            "reasoning": { "effort": "high", "effort_by_model": {} },
+            "rotation": { "sota": { "alias": "sota", "order": [] }, "sweet": { "alias": "sweet", "order": [] }, "first_output_seconds": 30 }
+          }
+          JSON
+          cd /tmp
+          /tmp/opencode2api -config /tmp/config.json > /tmp/gw.log 2>&1 &
+          echo $! > /tmp/gw.pid
+          for i in $(seq 1 60); do curl -sf -m 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 1; done
+          echo "HEALTHZ=$(curl -s -m 10 http://127.0.0.1:8080/healthz | head -c 200)"
+
+      - name: gateway models
+        run: |
+          set -u
+          code=$(curl -s -o /tmp/models.json -w '%{http_code}' -m 60 -H 'Authorization: Bearer sk-local-test' http://127.0.0.1:8080/v1/models)
+          echo "MODELS_HTTP=$code bytes=$(wc -c </tmp/models.json)"
+          python3 - <<'PY'
+          import json
+          try:
+              d=json.load(open('/tmp/models.json'))
+          except Exception as e:
+              print("MODELS_PARSE_FAIL", e); raise SystemExit
+          ids=[m.get('id') for m in d.get('data',[])]
+          print("MODELS_TOTAL", len(ids))
+          print("FREE_IDS", [i for i in ids if 'free' in (i or '').lower()][:20])
+          print("DS_IDS", [i for i in ids if 'deepseek' in (i or '').lower()][:10])
+          open('/tmp/model.txt','w').write('deepseek-v4.1-flash-free')
+          for cand in ids:
+              if cand and 'deepseek' in cand.lower() and 'free' in cand.lower():
+                  open('/tmp/model.txt','w').write(cand); break
+          print("CHOSEN", open('/tmp/model.txt').read())
+          PY
+
+      - name: gateway chat nonstream
+        run: |
+          set -u
+          m=$(cat /tmp/model.txt)
+          code=$(curl -s -o /tmp/r1.json -w '%{http_code}' -m 120 http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-local-test' \
+            -d "{\"model\":\"$m\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"用一个词回答：可用\"}]}")
+          echo "GW1 model=$m http=$code body=$(head -c 300 /tmp/r1.json | tr '\n' ' ')"
+          echo "GW1_429=$(grep -c 'FreeUsageLimitError\|Free usage limit' /tmp/r1.json || true)"
+
+      - name: gateway chat stream
+        run: |
+          set -u
+          m=$(cat /tmp/model.txt)
+          code=$(curl -s -N -o /tmp/r2.txt -w '%{http_code}' -m 120 http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Content-Type: application/json' -H 'Authorization: Bearer sk-local-test' \
+            -d "{\"model\":\"$m\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"用一句话说明你能做什么\"}]}")
+          echo "GW2 stream http=$code lines=$(wc -l </tmp/r2.txt) head=$(head -c 240 /tmp/r2.txt | tr '\n' ' ')"
+          echo "GW2_429=$(grep -c 'FreeUsageLimitError\|Free usage limit' /tmp/r2.txt || true)"
+
+      - name: official cli reference turn1
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: "1"
+          NO_COLOR: "1"
+        run: |
+          set -u
+          npm install -g @opencode/cli@latest >/tmp/npm.log 2>&1 || { echo "CLI_INSTALL_FAIL"; tail -5 /tmp/npm.log; exit 0; }
+          echo "CLI_VERSION=$(opencode --version 2>&1 | head -1)"
+          set +e
+          out=$(timeout 150 opencode run -m opencode/deepseek-v4.1-flash-free "你好，请用一句话说明你能做什么。只回复这一句。" 2>&1)
+          rc=$?
+          set -e
+          clean=$(printf '%s' "$out" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g')
+          echo "CLI1 rc=$rc chars=${#clean}"
+          echo "CLI1_TEXT=$(printf '%s' "$clean" | tail -3 | tr '\n' '|' | head -c 300)"
+
+      - name: official cli reference turn2
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: "1"
+          NO_COLOR: "1"
+        run: |
+          set -u
+          set +e
+          out=$(timeout 150 opencode run --continue "请复述你上一句回答的前半句，不要展开。" 2>&1)
+          rc=$?
+          set -e
+          clean=$(printf '%s' "$out" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g')
+          echo "CLI2 rc=$rc chars=${#clean}"
+          echo "CLI2_TEXT=$(printf '%s' "$clean" | tail -3 | tr '\n' '|' | head -c 300)"
+
+      - name: gateway log tail
+        if: always()
+        run: |
+          echo "GW_LOG_429=$(grep -c 'free-usage\|FreeUsageLimit' /tmp/gw.log || true)"
+          tail -20 /tmp/gw.log | cut -c1-220
+          kill "$(cat /tmp/gw.pid)" 2>/dev/null || true
